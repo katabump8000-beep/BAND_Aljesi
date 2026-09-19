@@ -41,7 +41,7 @@ class TradingState:
         self.last_signal = None
         self.task = None
         self.status_msg = "في الانتظار"
-        self.current_candle = None
+        self.client = None  # نحتفظ بالاتصال للاستخدام من الأزرار
 
 state = TradingState()
 
@@ -60,6 +60,82 @@ def seconds_to_candle_close():
     candle_close = candle_open + period
     return candle_close - now
 
+# ═══════════════════════════════════════
+# 🤝 الاتصال بـ Pocket Option
+# ═══════════════════════════════════════
+async def ensure_connected():
+    """يتأكد إن عندنا اتصال شغال بـ Pocket Option"""
+    if state.client is not None and state.connected:
+        return True
+    
+    try:
+        from BinaryOptionsToolsV2 import PocketOptionAsync
+        state.client = PocketOptionAsync(ssid=SSID)
+        await state.client.__aenter__()
+        state.connected = True
+        state.balance = await state.client.balance()
+        logger.info(f"✅ متصل بـ Pocket Option | الرصيد: ${state.balance}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ فشل الاتصال: {e}")
+        state.connected = False
+        state.client = None
+        return False
+
+async def close_connection():
+    """إغلاق الاتصال"""
+    if state.client:
+        try:
+            await state.client.__aexit__(None, None, None)
+        except Exception:
+            pass
+    state.client = None
+    state.connected = False
+
+# ═══════════════════════════════════════
+# 💰 تنفيذ صفقة يدوية
+# ═══════════════════════════════════════
+async def execute_manual_trade(direction: str):
+    """تنفيذ صفقة يدوية (call/put)"""
+    if not await ensure_connected():
+        return None, "❌ فشل الاتصال بـ Pocket Option"
+    
+    try:
+        amount = CONFIG["initial_amount"]
+        logger.info(f"💰 صفقة يدوية: {direction.upper()} | ${amount}")
+        
+        trade_id, _ = await state.client.buy(
+            CONFIG["asset"],
+            amount,
+            CONFIG["trade_duration"],
+        )
+        
+        state.total_trades += 1
+        logger.info(f"✅ صفقة #{state.total_trades} | ID: {trade_id}")
+        
+        # ننتظر النتيجة
+        result = await state.client.check_win(trade_id)
+        logger.info(f"📊 النتيجة: {result}")
+        
+        if result == "win":
+            state.wins += 1
+            state.pnl += amount * 0.92
+            outcome = f"✅ ربح! +${amount * 0.92:.2f}"
+        else:
+            state.losses += 1
+            state.pnl -= amount
+            outcome = f"❌ خسارة! -${amount:.2f}"
+        
+        state.balance = await state.client.balance()
+        
+        return outcome, None
+    except Exception as e:
+        logger.error(f"❌ خطأ في الصفقة: {e}")
+        return None, f"❌ خطأ: {e}"
+
+# ═══════════════════════════════════════
+# 🤖 حلقة التداول الآلي
+# ═══════════════════════════════════════
 async def trading_loop():
     logger.info("🚀 بدء حلقة التداول...")
     state.status_msg = "جاري الاتصال..."
@@ -68,6 +144,7 @@ async def trading_loop():
         from BinaryOptionsToolsV2 import PocketOptionAsync
         
         async with PocketOptionAsync(ssid=SSID) as client:
+            state.client = client
             state.connected = True
             state.balance = await client.balance()
             state.status_msg = "متصل - في انتظار إشارة"
@@ -75,7 +152,6 @@ async def trading_loop():
             
             last_processed_candle_time = None
             
-            # استخدام get_candles_live - الطريقة الرسمية
             async for closed_candles, forming_candle in client.get_candles_live(
                 CONFIG["asset"],
                 period=CONFIG["candle_period"],
@@ -86,18 +162,12 @@ async def trading_loop():
                     break
                 
                 try:
-                    # خزّن الشمعة الحالية
-                    state.current_candle = forming_candle
-                    
-                    # نتحقق من الإشارة على الشموع المغلقة + الشمعة الحالية
                     if len(closed_candles) < CONFIG["candle_count"]:
                         continue
                     
-                    # آخر (candle_count - 1) شمعة مغلقة + الشمعة الحالية
                     needed_closed = CONFIG["candle_count"] - 1
                     last_closed = closed_candles[-needed_closed:] if needed_closed > 0 else []
                     
-                    # فحص لون الشموع
                     closed_colors = [
                         get_color(c.get("open", c.get("o", 0)), c.get("close", c.get("c", 0)))
                         for c in last_closed
@@ -110,21 +180,19 @@ async def trading_loop():
                             forming_candle.get("close", forming_candle.get("c", 0)),
                         )
                     
-                    # الإشارة: كل الشموع المغلقة + الشمعة الحالية بنفس اللون
                     all_colors = closed_colors + ([forming_color] if forming_color else [])
                     
                     signal = None
                     if len(all_colors) >= CONFIG["candle_count"]:
                         if all(c == "green" for c in all_colors[-CONFIG["candle_count"]:]):
                             signal = "call"
-                        elif all(c == "red" for c in all_colors[-CONFIG["candle_count"]]):
+                        elif all(c == "red" for c in all_colors[-CONFIG["candle_count"]:]):
                             signal = "put"
                     
                     if not signal:
                         await asyncio.sleep(1)
                         continue
                     
-                    # نجيب وقت الشمعة الحالية عشان نتجنب التكرار
                     current_candle_time = None
                     if forming_candle:
                         current_candle_time = forming_candle.get("time") or forming_candle.get("timestamp")
@@ -133,13 +201,10 @@ async def trading_loop():
                         await asyncio.sleep(1)
                         continue
                     
-                    # ═══ إشارة تحققت ═══
                     state.last_signal = signal
                     state.status_msg = f"إشارة {signal.upper()} - في انتظار التوقيت"
-                    logger.info(f"🎯 إشارة: {signal.upper()} | الشمعة الحالية: {forming_color}")
+                    logger.info(f"🎯 إشارة: {signal.upper()} | الشمعة: {forming_color}")
                     
-                    # ═══ ننتظر التوقيت المناسب ═══
-                    # ننتظر لين نصل للنافذة الزمنية (قبل 22 ثانية من إغلاق الشمعة)
                     waited = 0
                     while state.running and waited < 55:
                         secs = seconds_to_candle_close()
@@ -153,10 +218,8 @@ async def trading_loop():
                     
                     last_processed_candle_time = current_candle_time
                     
-                    # ═══ تنفيذ الصفقة ═══
                     amount = calculate_amount()
                     if amount is None:
-                        logger.warning("⛔ وصلنا للحد الأقصى من Martingale. إعادة تعيين.")
                         state.martingale_step = 0
                         continue
                     
@@ -170,11 +233,9 @@ async def trading_loop():
                             CONFIG["trade_duration"],
                         )
                         state.total_trades += 1
-                        logger.info(f"✅ صفقة #{state.total_trades} | ID: {trade_id}")
                         
                         state.status_msg = "في انتظار نتيجة الصفقة"
                         result = await client.check_win(trade_id)
-                        logger.info(f"📊 النتيجة: {result}")
                         
                         if result == "win":
                             state.wins += 1
@@ -191,7 +252,6 @@ async def trading_loop():
                         state.status_msg = "في انتظار إشارة"
                     except Exception as e:
                         logger.error(f"❌ خطأ في الصفقة: {e}")
-                        state.status_msg = f"خطأ: {e}"
                 
                 except Exception as e:
                     logger.error(f"⚠️ خطأ في الحلقة: {e}")
@@ -206,6 +266,9 @@ async def trading_loop():
         state.status_msg = "متوقف"
         logger.info("🛑 توقف حلقة التداول")
 
+# ═══════════════════════════════════════
+# 🎨 واجهة تلجرام
+# ═══════════════════════════════════════
 def dashboard_keyboard():
     if state.running:
         main_btn = InlineKeyboardButton("⏹️ إيقاف البوت", callback_data="stop_bot")
@@ -214,6 +277,10 @@ def dashboard_keyboard():
     
     return InlineKeyboardMarkup([
         [main_btn],
+        [
+            InlineKeyboardButton("🟢 شراء (BUY)", callback_data="manual_buy"),
+            InlineKeyboardButton("🔴 بيع (SELL)", callback_data="manual_sell"),
+        ],
         [InlineKeyboardButton("🔄 تحديث", callback_data="refresh")],
         [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")],
     ])
@@ -255,11 +322,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state.running = True
             state.task = asyncio.create_task(trading_loop())
         await query.edit_message_text(dashboard_text(), reply_markup=dashboard_keyboard())
+    
     elif data == "stop_bot":
         state.running = False
         await query.edit_message_text(dashboard_text(), reply_markup=dashboard_keyboard())
+    
     elif data == "refresh":
         await query.edit_message_text(dashboard_text(), reply_markup=dashboard_keyboard())
+    
     elif data == "settings":
         await query.edit_message_text(
             "⚙️ **إعدادات الاستراتيجية**\n\n"
@@ -273,6 +343,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ رجوع", callback_data="refresh")],
             ]),
+        )
+    
+    elif data == "manual_buy":
+        await query.answer("⏳ جاري فتح صفقة شراء...")
+        await query.edit_message_text(
+            dashboard_text() + "\n\n⏳ **جاري تنفيذ صفقة شراء...**",
+            reply_markup=dashboard_keyboard(),
+        )
+        outcome, error = await execute_manual_trade("call")
+        result_text = outcome if outcome else error
+        
+        await query.edit_message_text(
+            dashboard_text() + f"\n\n📊 **نتيجة الصفقة:**\n{result_text}",
+            reply_markup=dashboard_keyboard(),
+        )
+    
+    elif data == "manual_sell":
+        await query.answer("⏳ جاري فتح صفقة بيع...")
+        await query.edit_message_text(
+            dashboard_text() + "\n\n⏳ **جاري تنفيذ صفقة بيع...**",
+            reply_markup=dashboard_keyboard(),
+        )
+        outcome, error = await execute_manual_trade("put")
+        result_text = outcome if outcome else error
+        
+        await query.edit_message_text(
+            dashboard_text() + f"\n\n📊 **نتيجة الصفقة:**\n{result_text}",
+            reply_markup=dashboard_keyboard(),
         )
 
 def main():
