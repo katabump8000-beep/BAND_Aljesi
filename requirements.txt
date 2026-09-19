@@ -1,2 +1,0 @@
-BinaryOptionsToolsV2
-python-telegram-bot==21.6
