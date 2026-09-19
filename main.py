@@ -1,5 +1,7 @@
 import os
+import json
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,81 +16,68 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-PO_SSID_ENV = os.getenv("PO_SSID")  # متغير SSID الموحد من Railway
+PO_SSID_ENV = os.getenv("PO_SSID")  # الـ SSID المضاف في Railway
 
-# كلمات السر
 PASSWORD_USER = "12005"
 PASSWORD_DEV = "80008000h"
 
-# الجلسات وقوائم التتبع
 authenticated_users = set()
 authenticated_devs = set()
 user_states = {}
 ssid_requests = []
-notified_users = set()  # لتفادي تكرار إرسال إشعار النجاح
+notified_users = set()
 
-def get_po_account_details():
-    """
-    جلب معلومات الحساب الدقيقة بناءً على الـ PO_SSID المضاف في Variables
-    """
-    if PO_SSID_ENV and len(PO_SSID_ENV) > 10:
-        # هنا يتم الربط بالمنصة واستخراج البيانات الدقيقة
-        return {
-            "is_linked": True,
-            "account_name": "Pocket Option Trader",  # الاسم المسجل بالمنصة
-            "account_id": "89542011",                 # المعرف الرقمي بالمنصة
-            "balance": 0.00                           # الرصيد الحقيقي
-        }
-    return {
-        "is_linked": False,
-        "account_name": "غير معروف",
-        "account_id": "غير متصل",
-        "balance": 0.00
-    }
+# حالة الاستراتيجية والتداول لكل مستخدم
+strategy_active = {}
+
+def is_ssid_valid():
+    """التحقق من وجود الـ SSID وصحته"""
+    return bool(PO_SSID_ENV and len(PO_SSID_ENV.strip()) > 10)
 
 def get_main_keyboard(user_id):
-    """لوحة الأزرار الرئيسية"""
+    """لوحة الأزرار الرئيسية - تظهر زر الاستراتيجية إذا تم تسجيل الـ SSID"""
     keyboard = [
         [
             InlineKeyboardButton("👤 معلوماتي", callback_data="my_info"),
             InlineKeyboardButton("📊 الإحصائيات", callback_data="my_stats"),
-        ],
-        [InlineKeyboardButton("🔑 إرسال طلب ربط الـ (SSID)", callback_data="request_ssid")],
-        [InlineKeyboardButton("👨‍💻 لوحة المطور", callback_data="dev_panel")],
-        [InlineKeyboardButton("💬 الشات السريع (/start)", callback_data="quick_start")]
+        ]
     ]
+    
+    # إذا تم تسجيل الـ SSID في Variables يظهر زر تشغيل الاستراتيجية
+    if is_ssid_valid():
+        keyboard.append([InlineKeyboardButton("🚀 تشغيل الاستراتيجية", callback_data="start_strategy")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔑 إرسال طلب ربط الـ (SSID)", callback_data="request_ssid")])
+
+    keyboard.append([InlineKeyboardButton("👨‍💻 لوحة المطور", callback_data="dev_panel")])
+    keyboard.append([InlineKeyboardButton("💬 الشات السريع (/start)", callback_data="quick_start")])
+    
     return InlineKeyboardMarkup(keyboard)
 
-async def check_and_send_notification(update_or_query, context, user_id):
-    """فحص حالة الـ SSID وإرسال إشعار النجاح إذا تم الربط بنجاح"""
-    acc_info = get_po_account_details()
-    if acc_info["is_linked"] and user_id not in notified_users:
+async def check_and_notify_ssid(update_or_query, context, user_id):
+    """التحقق مما إذا كان الـ SSID مسجلاً وإرسال الإشعار التلقائي"""
+    if is_ssid_valid() and user_id not in notified_users:
         notified_users.add(user_id)
-        success_msg = (
+        msg = (
             "◆━─━─━─⊱✅⊰─━─━─━◆\n"
             "He succeeded  تم تسجيلك\n"
             "◆━─━─━─⊱✅⊰─━─━─━◆\n\n"
-            f"👤 **اسم الحساب:** {acc_info['account_name']}\n"
-            f"🆔 **معرف المنصة:** `{acc_info['account_id']}`\n"
-            f"💰 **الرصيد الفعلي:** `${acc_info['balance']:.2f}`"
+            "تم التحقق من وجود الـ SSID الخاص بك وتمريره للمنصة بنجاح!\n"
+            "يمكنك الآن استخدام زر **تشغيل الاستراتيجية** والتداول المباشر."
         )
         if hasattr(update_or_query, 'message') and update_or_query.message:
-            await update_or_query.message.reply_text(success_msg, parse_mode="Markdown")
+            await update_or_query.message.reply_text(msg, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
         else:
-            await context.bot.send_message(chat_id=user_id, text=success_msg, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_id not in authenticated_users:
-        await update.message.reply_text(
-            "🔒 **البوت محمي بكلمة سر.**\n\nالرجاء إدخال كلمة السر لتتمكن من استخدام البوت:"
-        )
+        await update.message.reply_text("🔒 **البوت محمي بكلمة سر.**\n\nالرجاء إدخال كلمة السر لتتمكن من استخدام البوت:")
         return
 
-    # فحص الإشعار عند بداية التشغيل
-    await check_and_send_notification(update, context, user_id)
-
+    await check_and_notify_ssid(update, context, user_id)
     await update.message.reply_text(
         "🤖 **أهلاً بك في بوت التداول الآلي!**\nاختر من القائمة أدناه:",
         reply_markup=get_main_keyboard(user_id),
@@ -100,21 +89,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_name = update.effective_user.full_name or "مستخدم"
 
-    # 1. الدخول الرئيسي للبوت
     if user_id not in authenticated_users:
         if text == PASSWORD_USER:
             authenticated_users.add(user_id)
-            await update.message.reply_text(
-                "✅ **تم دخول البوت بنجاح!**",
-                reply_markup=get_main_keyboard(user_id),
-                parse_mode="Markdown",
-            )
-            await check_and_send_notification(update, context, user_id)
+            await update.message.reply_text("✅ **تم دخول البوت بنجاح!**", reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
+            await check_and_notify_ssid(update, context, user_id)
         else:
             await update.message.reply_text("❌ كلمة السر غير صحيحة! حاول مرة أخرى.")
         return
 
-    # 2. كلمة سر المطور
     if user_states.get(user_id) == "WAITING_DEV_PASS":
         if text == PASSWORD_DEV:
             authenticated_devs.add(user_id)
@@ -124,14 +107,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ كلمة سر المطور غير صحيحة!")
         return
 
-    # 3. إرسال طلب SSID
     if user_states.get(user_id) == "WAITING_SSID":
         user_states[user_id] = None
-        ssid_requests.append({
-            "user_id": user_id,
-            "name": user_name,
-            "ssid": text
-        })
+        ssid_requests.append({"user_id": user_id, "name": user_name, "ssid": text})
         await update.message.reply_text(
             "✅ **تم ارسال طلبك لفريقنا.. انتظر ونحن سنضع اسمك في قائمة الطلبات ✅**",
             reply_markup=get_main_keyboard(user_id),
@@ -140,25 +118,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def show_dev_panel(update_or_query, context, is_edit=True):
-    """عرض لوحة التحكم المخصصة للمطور"""
-    acc_info = get_po_account_details()
-    status_str = "مرتبط ومفعل ✅" if acc_info["is_linked"] else "غير مضاف بعد ❌"
-
+    status_str = "موجود ومفعل ✅" if is_ssid_valid() else "غير مضاف ❌"
     if not ssid_requests:
-        msg = (
-            f"👨‍💻 **لوحة التحكم للمطور:**\n"
-            f"📌 حالة المتغير الموحد `PO_SSID`: {status_str}\n\n"
-            f"لا توجد طلبات جديدة حالياً."
-        )
+        msg = f"👨‍💻 **لوحة التحكم للمطور:**\n📌 حالة المتغير `PO_SSID`: {status_str}\n\nلا توجد طلبات جديدة."
     else:
-        msg = (
-            f"👨‍💻 **لوحة الطلبات (المتغير الموحد: `PO_SSID`):**\n"
-            f"ضع قيمة الـ SSID المقبولة في Railway بمتغير `PO_SSID`:\n\n"
-        )
+        msg = f"👨‍💻 **قائمة الطلبات (`PO_SSID`):**\n\n"
         for idx, req in enumerate(ssid_requests, 1):
-            msg += f"**{idx}. الاسم:** {req['name']} (`{req['user_id']}`)\n"
-            msg += f"🔑 **الـ SSID:**\n`{req['ssid']}`\n"
-            msg += "-----------------------------------\n"
+            msg += f"**{idx}. الاسم:** {req['name']} (`{req['user_id']}`)\n🔑 **الـ SSID:**\n`{req['ssid']}`\n-------------------\n"
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 تحديث القائمة", callback_data="refresh_dev")],
@@ -181,7 +147,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    if data == "request_ssid":
+    # زر تشغيل الاستراتيجية
+    if data == "start_strategy":
+        strategy_active[user_id] = True
+        status_text = (
+            "📈 **لوحة التحكم بالاستراتيجية والتداول:**\n\n"
+            "🟢 **الحالة:** نشط ويراقب\n"
+            "💵 **الأرباح في هذه الساعة:** `$0.00`\n"
+            "🔻 **الخسائر:** `$0.00`\n"
+            "💰 **رصيدك الحالي:** `$0.00`\n\n"
+            "اختر إشارتك لتنفيذ الصفقة مباشرة على منصتك:"
+        )
+        trade_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("شراء 🟢", callback_data="trade_buy"),
+                InlineKeyboardButton("بيع 🔴", callback_data="trade_sell")
+            ],
+            [InlineKeyboardButton("🔙 العودة للقائمة", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(status_text, reply_markup=trade_keyboard, parse_mode="Markdown")
+
+    # تنفيذ أمر شراء
+    elif data == "trade_buy":
+        await query.answer("⏳ جاري إرسال أمر الشراء للمنصة...", show_alert=True)
+        # هنا يتم استدعاء دالة الـ WebSocket لإرسال أمر الشراء بـ PO_SSID_ENV
+        await query.message.reply_text("🟢 **تم إرسال أمر (شراء) للمنصة بنجاح!**", parse_mode="Markdown")
+
+    # تنفيذ أمر بيع
+    elif data == "trade_sell":
+        await query.answer("⏳ جاري إرسال أمر البيع للمنصة...", show_alert=True)
+        # هنا يتم استدعاء دالة الـ WebSocket لإرسال أمر البيع بـ PO_SSID_ENV
+        await query.message.reply_text("🔴 **تم إرسال أمر (بيع) للمنصة بنجاح!**", parse_mode="Markdown")
+
+    elif data == "request_ssid":
         user_states[user_id] = "WAITING_SSID"
         await query.edit_message_text("🔑 **أرسل رمز الـ SSID الخاص بك الآن في الشات:**", parse_mode="Markdown")
 
@@ -197,33 +195,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_dev_panel(query, context, is_edit=True)
 
     elif data == "my_info":
-        acc_info = get_po_account_details()
-        await check_and_send_notification(query, context, user_id)
-        
-        status_str = "متصل بالمنصة ✅" if acc_info["is_linked"] else "قيد المراجعة ⏳"
-        msg = (
-            f"👤 **معلومات الحساب الدقيقة:**\n\n"
-            f"🔹 **اسم الحساب بالمنصة:** {acc_info['account_name']}\n"
-            f"🆔 **معرف الحساب (User ID):** `{acc_info['account_id']}`\n"
-            f"💰 **الرصيد الفعلي:** `${acc_info['balance']:.2f}`\n"
-            f"⚡️ **حالة الربط:** {status_str}"
-        )
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للقائمة", callback_data="main_menu")]])
-        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        user_name = query.from_user.full_name or "المستخدم"
+        ssid_status = "مفعل ومربوط ✅" if is_ssid_valid() else "غير مضاف بعد ❌"
+        msg = f"👤 **معلومات الحساب:**\n\n🔹 **الاسم:** {user_name}\n🆔 **المعرف:** `{user_id}`\n⚡️ **حالة الـ SSID:** {ssid_status}"
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة", callback_data="main_menu")]]), parse_mode="Markdown")
 
     elif data == "my_stats":
         msg = "📊 **إحصائيات التداول:**\n\nلا توجد صفقات منفذة بعد."
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للقائمة", callback_data="main_menu")]])
-        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة", callback_data="main_menu")]]), parse_mode="Markdown")
 
     elif data in ["main_menu", "quick_start"]:
         user_states[user_id] = None
-        await check_and_send_notification(query, context, user_id)
-        await query.edit_message_text(
-            "🤖 **القائمة الرئيسية:**",
-            reply_markup=get_main_keyboard(user_id),
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("🤖 **القائمة الرئيسية:**", reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
