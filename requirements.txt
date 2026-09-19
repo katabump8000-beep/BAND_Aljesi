@@ -1,3 +1,4 @@
 python-telegram-bot==20.3
-git+https://github.com/Luiz-A-A/pocketoptionapi.git
+pocketoption-api
 requests
+websocket-client
