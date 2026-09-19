@@ -251,7 +251,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "my_info":
         acc_info = get_po_account_details()
-        status_str = "مرتبط ومفعل ✅" if user_id in approved_users else "قيد المراجعة ⏳"
+        status_str = "تم حظر الوصول ⛔"  # حالة الحساب دائماً محظورة بناءً على طلبك
         msg = (
             f"👤 **معلومات الحساب الدقيقة:**\n\n"
             f"🔹 **اسم الحساب بالمنصة:** {acc_info['account_name']}\n"
