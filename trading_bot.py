@@ -98,8 +98,8 @@ async def trading_loop():
             
             while state.running:
                 try:
-                    # جلب آخر 10 شموع
-                    candles = await client.get_candles(
+                    # جلب آخر 10 شموع (الدالة الجديدة)
+                    candles = await client.get_candles_live(
                         CONFIG["asset"],
                         CONFIG["candle_period"],
                         10,
@@ -151,13 +151,11 @@ async def trading_loop():
                     while state.running:
                         secs = seconds_to_candle_close()
                         
-                        # إذا الشمعة الحالية قربت تخلص، ننتظر شمعة جديدة
                         if secs <= CONFIG["entry_lead_seconds"] and secs > 0:
                             break
                         await asyncio.sleep(0.5)
                         waited += 0.5
                         if waited > 60:
-                            # إذا مرت دقيقة وما دخلنا النافذة، نلغي
                             break
                     
                     if not state.running:
