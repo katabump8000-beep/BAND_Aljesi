@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import logging
+import warnings
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -13,6 +14,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# نتجاهل تحذير get_candles
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ═══════════════════════════════════════
 # ⚙️ الإعدادات (من Railway Variables)
@@ -77,6 +81,28 @@ def seconds_to_candle_close():
     candle_close = candle_open + period
     return candle_close - now
 
+async def fetch_candles(client):
+    """جلب الشموع - يدعم الطريقتين"""
+    try:
+        # الطريقة الجديدة (generator)
+        gen = client.get_candles_live(CONFIG["asset"], CONFIG["candle_period"], 10)
+        if hasattr(gen, "__aiter__"):
+            # هي async generator - ناخذ أول عنصر
+            candles = []
+            async for c in gen:
+                candles.append(c)
+                if len(candles) >= 10:
+                    break
+            return candles
+    except Exception:
+        pass
+    
+    # الطريقة القديمة
+    try:
+        return await client.get_candles(CONFIG["asset"], CONFIG["candle_period"], 10)
+    except Exception:
+        return []
+
 # ═══════════════════════════════════════
 # 🔄 حلقة التداول
 # ═══════════════════════════════════════
@@ -98,35 +124,25 @@ async def trading_loop():
             
             while state.running:
                 try:
-                    # جلب آخر 10 شموع (الدالة الجديدة)
-                    candles = await client.get_candles_live(
-                        CONFIG["asset"],
-                        CONFIG["candle_period"],
-                        10,
-                    )
+                    candles = await fetch_candles(client)
                     
                     if not candles or len(candles) < CONFIG["candle_count"] + 1:
                         await asyncio.sleep(3)
                         continue
                     
-                    # نتجاهل الشمعة الحالية (غير مغلقة) وناخذ المغلقة فقط
                     closed_candles = candles[:-1]
                     
                     if len(closed_candles) < CONFIG["candle_count"]:
                         await asyncio.sleep(3)
                         continue
                     
-                    # آخر N شموع مغلقة
                     last_n = closed_candles[-CONFIG["candle_count"]:]
-                    
-                    # نتحقق من آخر شمعة مغلقة (لتجنب التكرار)
                     last_closed_time = last_n[-1].get("time") or last_n[-1].get("timestamp")
                     
                     if last_closed_time == last_candle_time:
                         await asyncio.sleep(2)
                         continue
                     
-                    # ألوان الشموع
                     colors = [get_candle_color(c) for c in last_n]
                     
                     signal = None
@@ -140,17 +156,14 @@ async def trading_loop():
                         await asyncio.sleep(2)
                         continue
                     
-                    # ═══ إشارة تحققت ═══
                     last_candle_time = last_closed_time
                     state.last_signal = signal
                     state.status_msg = f"إشارة {signal.upper()} - في انتظار التوقيت"
                     logger.info(f"🎯 إشارة: {signal.upper()}")
                     
-                    # ننتظر لين ندخل النافذة الزمنية
                     waited = 0
                     while state.running:
                         secs = seconds_to_candle_close()
-                        
                         if secs <= CONFIG["entry_lead_seconds"] and secs > 0:
                             break
                         await asyncio.sleep(0.5)
@@ -163,11 +176,10 @@ async def trading_loop():
                     
                     amount = calculate_amount()
                     if amount is None:
-                        logger.warning("⛔ وصلنا للحد الأقصى. إعادة تعيين Martingale.")
+                        logger.warning("⛔ الحد الأقصى. إعادة تعيين.")
                         state.martingale_step = 0
                         continue
                     
-                    # ═══ تنفيذ الصفقة ═══
                     state.status_msg = f"فتح صفقة {signal.upper()} بـ ${amount}"
                     logger.info(f"💰 فتح صفقة: {signal} | ${amount}")
                     
