@@ -58,20 +58,28 @@ state = TradingState()
 # 📊 منطق الاستراتيجية
 # ═══════════════════════════════════════
 def get_candle_color(candle):
-    return "green" if candle["close"] > candle["open"] else "red"
+    """أخضر إذا close > open، أحمر إذا close < open"""
+    o = candle.get("open") or candle.get("o") or 0
+    c = candle.get("close") or candle.get("c") or 0
+    return "green" if c > o else "red"
 
 def calculate_amount():
+    """حساب المبلغ حسب Martingale"""
     if state.martingale_step >= CONFIG["max_martingale_steps"]:
         return None
     return CONFIG["initial_amount"] * (CONFIG["martingale_multiplier"] ** state.martingale_step)
 
 def seconds_to_candle_close():
+    """الثواني المتبقية لإغلاق الشمعة الحالية"""
     now = time.time()
     period = CONFIG["candle_period"]
     candle_open = now - (now % period)
     candle_close = candle_open + period
     return candle_close - now
 
+# ═══════════════════════════════════════
+# 🔄 حلقة التداول
+# ═══════════════════════════════════════
 async def trading_loop():
     """حلقة التداول الرئيسية"""
     logger.info("🚀 بدء حلقة التداول...")
@@ -86,81 +94,123 @@ async def trading_loop():
             state.status_msg = "متصل - في انتظار إشارة"
             logger.info(f"✅ متصل! الرصيد: ${state.balance}")
             
-            async for candle in client.subscribe_symbol(CONFIG["asset"]):
-                if not state.running:
-                    break
-                if "time" not in candle:
-                    continue
-                
-                state.candle_history.append(candle)
-                if len(state.candle_history) > 50:
-                    state.candle_history.pop(0)
-                
-                if len(state.candle_history) < CONFIG["candle_count"]:
-                    continue
-                
-                last_n = state.candle_history[-CONFIG["candle_count"]:]
-                colors = [get_candle_color(c) for c in last_n]
-                
-                signal = None
-                if all(c == "green" for c in colors):
-                    signal = "call"
-                elif all(c == "red" for c in colors):
-                    signal = "put"
-                
-                if not signal:
-                    continue
-                
-                state.last_signal = signal
-                state.status_msg = f"إشارة {signal.upper()} - في انتظار التوقيت"
-                logger.info(f"🎯 إشارة: {signal.upper()}")
-                
-                while state.running:
-                    secs = seconds_to_candle_close()
-                    if secs <= CONFIG["entry_lead_seconds"] and secs > 0:
-                        break
-                    await asyncio.sleep(0.5)
-                
-                if not state.running:
-                    break
-                
-                amount = calculate_amount()
-                if amount is None:
-                    logger.warning("⛔ وصلنا للحد الأقصى. إعادة تعيين Martingale.")
-                    state.martingale_step = 0
-                    continue
-                
+            last_candle_time = None
+            
+            while state.running:
                 try:
-                    state.status_msg = f"فتح صفقة {signal.upper()} بـ ${amount}"
-                    trade_id, _ = await client.buy(
-                        CONFIG["asset"], amount, CONFIG["trade_duration"],
-                        action=signal,
+                    # جلب آخر 10 شموع
+                    candles = await client.get_candles(
+                        CONFIG["asset"],
+                        CONFIG["candle_period"],
+                        10,
                     )
-                    state.total_trades += 1
-                    logger.info(f"✅ صفقة #{state.total_trades} | {signal} | ${amount}")
                     
-                    state.status_msg = "في انتظار نتيجة الصفقة"
-                    result = await client.check_win(trade_id)
+                    if not candles or len(candles) < CONFIG["candle_count"] + 1:
+                        await asyncio.sleep(3)
+                        continue
                     
-                    if result == "win":
-                        state.wins += 1
+                    # نتجاهل الشمعة الحالية (غير مغلقة) وناخذ المغلقة فقط
+                    closed_candles = candles[:-1]
+                    
+                    if len(closed_candles) < CONFIG["candle_count"]:
+                        await asyncio.sleep(3)
+                        continue
+                    
+                    # آخر N شموع مغلقة
+                    last_n = closed_candles[-CONFIG["candle_count"]:]
+                    
+                    # نتحقق من آخر شمعة مغلقة (لتجنب التكرار)
+                    last_closed_time = last_n[-1].get("time") or last_n[-1].get("timestamp")
+                    
+                    if last_closed_time == last_candle_time:
+                        await asyncio.sleep(2)
+                        continue
+                    
+                    # ألوان الشموع
+                    colors = [get_candle_color(c) for c in last_n]
+                    
+                    signal = None
+                    if all(c == "green" for c in colors):
+                        signal = "call"
+                    elif all(c == "red" for c in colors):
+                        signal = "put"
+                    
+                    if not signal:
+                        last_candle_time = last_closed_time
+                        await asyncio.sleep(2)
+                        continue
+                    
+                    # ═══ إشارة تحققت ═══
+                    last_candle_time = last_closed_time
+                    state.last_signal = signal
+                    state.status_msg = f"إشارة {signal.upper()} - في انتظار التوقيت"
+                    logger.info(f"🎯 إشارة: {signal.upper()}")
+                    
+                    # ننتظر لين ندخل النافذة الزمنية
+                    waited = 0
+                    while state.running:
+                        secs = seconds_to_candle_close()
+                        
+                        # إذا الشمعة الحالية قربت تخلص، ننتظر شمعة جديدة
+                        if secs <= CONFIG["entry_lead_seconds"] and secs > 0:
+                            break
+                        await asyncio.sleep(0.5)
+                        waited += 0.5
+                        if waited > 60:
+                            # إذا مرت دقيقة وما دخلنا النافذة، نلغي
+                            break
+                    
+                    if not state.running:
+                        break
+                    
+                    amount = calculate_amount()
+                    if amount is None:
+                        logger.warning("⛔ وصلنا للحد الأقصى. إعادة تعيين Martingale.")
                         state.martingale_step = 0
-                        state.pnl += amount * 0.92
-                        logger.info("✅ ربح")
-                    else:
-                        state.losses += 1
-                        state.martingale_step += 1
-                        state.pnl -= amount
-                        logger.info(f"❌ خسارة | Martingale: {state.martingale_step}")
+                        continue
                     
-                    state.balance = await client.balance()
-                    state.status_msg = "في انتظار إشارة"
-                except Exception as e:
-                    logger.error(f"خطأ في الصفقة: {e}")
-                    state.status_msg = f"خطأ: {e}"
+                    # ═══ تنفيذ الصفقة ═══
+                    state.status_msg = f"فتح صفقة {signal.upper()} بـ ${amount}"
+                    logger.info(f"💰 فتح صفقة: {signal} | ${amount}")
+                    
+                    try:
+                        trade_id, _ = await client.buy(
+                            CONFIG["asset"],
+                            amount,
+                            CONFIG["trade_duration"],
+                            action=signal,
+                        )
+                        state.total_trades += 1
+                        logger.info(f"✅ صفقة #{state.total_trades} | ID: {trade_id}")
+                        
+                        state.status_msg = "في انتظار نتيجة الصفقة"
+                        result = await client.check_win(trade_id)
+                        logger.info(f"📊 النتيجة: {result}")
+                        
+                        if result == "win":
+                            state.wins += 1
+                            state.martingale_step = 0
+                            state.pnl += amount * 0.92
+                            logger.info("✅ ربح")
+                        else:
+                            state.losses += 1
+                            state.martingale_step += 1
+                            state.pnl -= amount
+                            logger.info(f"❌ خسارة | Martingale: {state.martingale_step}")
+                        
+                        state.balance = await client.balance()
+                        state.status_msg = "في انتظار إشارة"
+                    except Exception as trade_err:
+                        logger.error(f"❌ خطأ في الصفقة: {trade_err}")
+                        state.status_msg = f"خطأ صفقة: {trade_err}"
+                
+                except Exception as loop_err:
+                    logger.error(f"⚠️ خطأ في الحلقة: {loop_err}")
+                    state.status_msg = f"خطأ: {loop_err}"
+                    await asyncio.sleep(5)
     
     except Exception as e:
-        logger.error(f"خطأ في الاتصال: {e}")
+        logger.error(f"❌ خطأ في الاتصال: {e}")
         state.status_msg = f"خطأ اتصال: {e}"
     finally:
         state.connected = False
